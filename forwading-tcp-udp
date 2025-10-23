@@ -1,0 +1,139 @@
+#!/bin/bash
+
+PREFIX="madebyjishnu"
+
+echo "====================="
+echo "PORT FORWARD MANAGER"
+echo "====================="
+echo "1) Create Port Forward"
+echo "2) Delete Port Forward"
+echo "3) Check Status of Port Forwards"
+read -rp "Choose an option (1/2/3): " OPTION
+
+if [[ "$OPTION" == "1" ]]; then
+    # --- CREATE ---
+    read -rp "Enter target IP: " TARGET_IP
+    read -rp "Enter port or range (e.g., 19100 or 19100-19500): " PORT_INPUT
+    read -rp "Confirm creation for $TARGET_IP ports $PORT_INPUT? (y/n): " CONFIRM
+    if [[ $CONFIRM != [yY] ]]; then
+        echo "Aborted!"
+        exit 1
+    fi
+
+    # Generate file name
+    BASE_NAME="$PREFIX-${PORT_INPUT//-/_}-$TARGET_IP"
+    NAME="$BASE_NAME"
+    INDEX=1
+    while [[ -f "/etc/systemd/system/$NAME.service" ]]; do
+        NAME="$BASE_NAME.$INDEX"
+        ((INDEX++))
+    done
+
+    SCRIPT_PATH="/root/$NAME.sh"
+    echo "Creating forwarding script: $SCRIPT_PATH"
+
+    # Build loop for range or single port
+    if [[ "$PORT_INPUT" == *-* ]]; then
+        START_PORT="${PORT_INPUT%-*}"
+        END_PORT="${PORT_INPUT#*-}"
+        PORT_LOOP="for PORT in \$(seq $START_PORT $END_PORT); do
+  echo Forwarding TCP:\$PORT and UDP:\$PORT to $TARGET_IP:\$PORT
+  socat TCP-LISTEN:\$PORT,fork,reuseaddr TCP:$TARGET_IP:\$PORT &
+  socat UDP-LISTEN:\$PORT,fork,reuseaddr UDP:$TARGET_IP:\$PORT &
+done
+wait"
+    else
+        PORT_LOOP="PORT=$PORT_INPUT
+echo Forwarding TCP:\$PORT and UDP:\$PORT to $TARGET_IP:\$PORT
+socat TCP-LISTEN:\$PORT,fork,reuseaddr TCP:$TARGET_IP:\$PORT &
+socat UDP-LISTEN:\$PORT,fork,reuseaddr UDP:$TARGET_IP:\$PORT &
+wait"
+    fi
+
+    # Write the script
+    sudo tee "$SCRIPT_PATH" > /dev/null <<EOF
+#!/bin/bash
+$PORT_LOOP
+EOF
+
+    sudo chmod +x "$SCRIPT_PATH"
+
+    # Create systemd service
+    SERVICE_PATH="/etc/systemd/system/$NAME.service"
+    sudo tee "$SERVICE_PATH" > /dev/null <<EOF
+[Unit]
+Description=TCP + UDP Port Forward $PORT_INPUT to $TARGET_IP
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_PATH
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Reload systemd and start
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$NAME"
+    sudo systemctl start "$NAME"
+
+    # Status
+    sudo systemctl status "$NAME" --no-pager
+
+elif [[ "$OPTION" == "2" ]]; then
+    # --- DELETE ---
+    echo "Listing all port forwarding services created by madebyjishnu:"
+    SERVICES=$(ls /etc/systemd/system/ | grep "^$PREFIX")
+    if [[ -z "$SERVICES" ]]; then
+        echo "No services found to delete!"
+        exit 1
+    fi
+
+    echo "$SERVICES"
+    read -rp "Enter exact service name to delete: " DEL_NAME
+
+    if [[ ! -f "/etc/systemd/system/$DEL_NAME.service" ]]; then
+        echo "Service not found!"
+        exit 1
+    fi
+
+    echo "Stopping and deleting $DEL_NAME..."
+    sudo systemctl stop "$DEL_NAME"
+    sudo systemctl disable "$DEL_NAME"
+    sudo rm "/etc/systemd/system/$DEL_NAME.service"
+
+    SCRIPT_FILE="/root/$DEL_NAME.sh"
+    if [[ -f "$SCRIPT_FILE" ]]; then
+        sudo rm "$SCRIPT_FILE"
+    fi
+
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+    echo "$DEL_NAME deleted successfully!"
+
+elif [[ "$OPTION" == "3" ]]; then
+    # --- STATUS ---
+    echo "Checking status of all port forwarding services created by madebyjishnu..."
+    SERVICES=$(ls /etc/systemd/system/ | grep "^$PREFIX")
+    if [[ -z "$SERVICES" ]]; then
+        echo "No madebyjishnu services found."
+        exit 1
+    fi
+
+    for SVC in $SERVICES; do
+        echo "--------------------------------------"
+        echo "Service: $SVC"
+        systemctl is-active "$SVC" >/dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo "Status: ACTIVE / RUNNING"
+        else
+            echo "Status: INACTIVE / STOPPED"
+        fi
+    done
+    echo "--------------------------------------"
+
+else
+    echo "Invalid option!"
+fi
